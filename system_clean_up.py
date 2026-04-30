@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""MacOS System Cleanup — lean, efficient, conservative macOS cleaner."""
+
 import os
 import sys
 import subprocess
@@ -7,896 +9,614 @@ import platform
 import time
 import shutil
 import heapq
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import psutil
-from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, messagebox
-import threading
 import json
+from pathlib import Path
+
+import psutil
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+HOME = str(Path.home())
+MB = 1024 * 1024
+GB = 1024 ** 3
+
+CONFIG_PATH = os.path.join(HOME, ".system_cleanup_config.json")
+LOG_DIR = os.path.join(HOME, "Library/Logs/SystemCleanup")
+LOG_PATH = os.path.join(LOG_DIR, "cleanup.log")
+
+ALLOWED_ROOTS_RAW = [HOME, "/tmp", "/private/var/folders"]
+
+SKIP_DIRS = frozenset({".Trash", "Keychains", "Preferences", "Extensions"})
+SKIP_FILES = frozenset({"com.apple.dock.plist", "com.apple.finder.plist"})
+
+# Directories that are purely cache — safe to wipe contents
+CACHE_DIRS = [
+    os.path.join(HOME, "Library/Caches"),
+    os.path.join(HOME, "Library/Logs"),
+    os.path.join(HOME, "Library/Application Support/Google/Chrome/Default/Cache"),
+    os.path.join(HOME, "Library/Application Support/Google/Chrome/Default/Code Cache"),
+    os.path.join(HOME, "Library/Application Support/Firefox/Profiles"),
+    os.path.join(HOME, "Library/Safari/Cache"),
+    os.path.join(HOME, "Library/Containers/com.apple.Safari/Data/Library/Caches"),
+    os.path.join(HOME, "Library/Containers/com.apple.mail/Data/Library/Caches"),
+    os.path.join(HOME, "Library/Containers/com.apple.Photos/Data/Library/Caches"),
+    "/tmp",
+    "/private/var/folders",
+]
+
+# Developer caches — large, fully regenerated on next build/install
+DEV_CACHE_DIRS = [
+    os.path.join(HOME, "Library/Developer/Xcode/DerivedData"),
+    os.path.join(HOME, "Library/Caches/Homebrew"),
+    os.path.join(HOME, ".npm/_cacache"),
+    os.path.join(HOME, "Library/Caches/pip"),
+    os.path.join(HOME, "Library/Caches/Yarn"),
+    os.path.join(HOME, "Library/Caches/CocoaPods"),
+    os.path.join(HOME, ".composer/cache"),
+    os.path.join(HOME, ".gradle/caches"),
+]
+
+LOG_CLEANUP_DIRS = [
+    os.path.join(HOME, "Library/Logs/DiagnosticReports"),
+    os.path.join(HOME, "Library/Logs/CrashReporter"),
+]
+
+MAIL_DOWNLOADS = os.path.join(
+    HOME, "Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
+)
+
+# ── ANSI Colors ──────────────────────────────────────────────────────────────
+
+class C:
+    """ANSI color codes — disabled when not a TTY."""
+    _on = sys.stdout.isatty()
+    BOLD = "\033[1m" if _on else ""
+    DIM = "\033[2m" if _on else ""
+    GREEN = "\033[32m" if _on else ""
+    YELLOW = "\033[33m" if _on else ""
+    RED = "\033[31m" if _on else ""
+    CYAN = "\033[36m" if _on else ""
+    RESET = "\033[0m" if _on else ""
+    OK = "\033[32m✓\033[0m" if _on else "[OK]"
+    SKIP = "\033[2m⊘\033[0m" if _on else "[-]"
+    DOT = "\033[36m●\033[0m" if _on else "*"
+
+
+# ── SystemCleanup ────────────────────────────────────────────────────────────
 
 class SystemCleanup:
-    def __init__(self, dry_run: bool = False, log_path: str = None):
-        self.user_home = str(Path.home())
-        self.config_path = os.path.join(self.user_home, '.system_cleanup_config.json')
-        self.stats = {
-            'total_size': 0,
-            'total_files': 0,
-            'last_run': None
-        }
+    def __init__(self, dry_run: bool = False):
+        if platform.system() != "Darwin":
+            print(f"{C.RED}Error: This script only runs on macOS.{C.RESET}")
+            sys.exit(1)
+
         self.dry_run = dry_run
-        self.log_path = log_path or os.path.join(self.user_home, 'system_cleanup.log')
-        self.load_config()
-        self._platform_check()
-        self._log('SystemCleanup initialized.')
+        self.allowed_roots = [os.path.realpath(r) for r in ALLOWED_ROOTS_RAW]
+        self.stats = {"total_size": 0, "total_files": 0, "last_run": None}
+        self._load_config()
+        self._ensure_log_dir()
+        self._log("Session started" + (" [DRY RUN]" if dry_run else ""))
 
-    def _platform_check(self):
-        if platform.system() != 'Darwin':
-            raise EnvironmentError('This script is intended to run on macOS only.')
+    # ── Config ───────────────────────────────────────────────────────────
 
-    def _log(self, message: str):
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-        try:
-            with open(self.log_path, 'a') as log_file:
-                log_file.write(f'[{timestamp}] {message}\n')
-        except Exception:
-            pass
-
-    def _delete_file(self, file_path: str, file_size: float, callback=None) -> bool:
-        """Helper to delete a file, supports dry run, path validation, and logging."""
-        # Safety check: ensure path is within allowed directories
-        allowed_roots = [self.user_home, '/tmp', '/private/var/folders']
-        if not self._is_safe_path(file_path, allowed_roots):
-            self._log(f"Refusing to delete file outside allowed paths: {file_path}")
-            return False
-
-        # Skip symlinks for safety
-        if os.path.islink(file_path):
-            self._log(f"Skipping symlink: {file_path}")
-            return False
-
-        if self.dry_run:
-            self._log(f"[DRY RUN] Would remove: {file_path} ({file_size:.2f} MB)")
-            if callback:
-                callback(f"[DRY RUN] Would remove: {file_path} ({file_size:.2f} MB)")
-            return True
-        try:
-            os.remove(file_path)
-            self._log(f"Removed: {file_path} ({file_size:.2f} MB)")
-            if callback:
-                callback(f"Removed: {file_path} ({file_size:.2f} MB)")
-            return True
-        except (PermissionError, OSError) as e:
-            self._log(f"Failed to remove {file_path}: {e}")
-            if callback:
-                callback(f"Failed to remove: {file_path}")
-            return False
-
-    def _delete_dir(self, dir_path: str, dir_size: float, callback=None) -> bool:
-        """Helper to delete a directory, supports dry run, path validation, and logging."""
-        # Safety check: ensure path is within allowed directories
-        allowed_roots = [self.user_home, '/tmp', '/private/var/folders']
-        if not self._is_safe_path(dir_path, allowed_roots):
-            self._log(f"Refusing to delete directory outside allowed paths: {dir_path}")
-            return False
-
-        # Skip symlinks for safety
-        if os.path.islink(dir_path):
-            self._log(f"Skipping symlink directory: {dir_path}")
-            return False
-
-        if self.dry_run:
-            self._log(f"[DRY RUN] Would remove directory: {dir_path} ({dir_size:.2f} MB)")
-            if callback:
-                callback(f"[DRY RUN] Would remove directory: {dir_path} ({dir_size:.2f} MB)")
-            return True
-        try:
-            shutil.rmtree(dir_path)
-            self._log(f"Removed directory: {dir_path} ({dir_size:.2f} MB)")
-            if callback:
-                callback(f"Removed directory: {dir_path} ({dir_size:.2f} MB)")
-            return True
-        except (PermissionError, OSError) as e:
-            self._log(f"Failed to remove directory {dir_path}: {e}")
-            if callback:
-                callback(f"Failed to remove directory: {dir_path}")
-            return False
-
-    def _get_dir_size(self, path: str) -> float:
-        """Calculate directory size in MB, safely handling permissions and symlinks."""
-        total = 0
-        try:
-            for dp, dn, filenames in os.walk(path):
-                for f in filenames:
-                    fp = os.path.join(dp, f)
-                    if not os.path.islink(fp):
-                        try:
-                            total += os.path.getsize(fp)
-                        except (PermissionError, OSError):
-                            pass
-        except (PermissionError, OSError):
-            pass
-        return total / (1024 * 1024)  # Convert to MB
-
-    def _is_safe_path(self, path: str, allowed_roots: list) -> bool:
-        """Verify path is within allowed directories (prevents symlink attacks)."""
-        try:
-            real_path = os.path.realpath(path)
-            return any(
-                real_path.startswith(os.path.realpath(root))
-                for root in allowed_roots
-            )
-        except (PermissionError, OSError):
-            return False
-
-    def _iter_files(self, directory: str, skip_patterns: list = None, min_age_seconds: float = None):
-        """Generator yielding (path, size_mb, mtime) for files in directory.
-
-        Args:
-            directory: Root directory to scan
-            skip_patterns: List of substrings to skip in paths
-            min_age_seconds: Only yield files older than this (seconds since modification)
-        """
-        skip_patterns = skip_patterns or []
-        now = time.time()
-
-        try:
-            for root, dirs, files in os.walk(directory):
-                # Skip directories matching patterns
-                if any(skip in root for skip in skip_patterns):
-                    continue
-
-                for file in files:
-                    # Skip hidden files and system files
-                    if file.startswith(".") or file in ["com.apple.dock.plist", "com.apple.finder.plist"]:
-                        continue
-
-                    file_path = os.path.join(root, file)
-
-                    # Skip symlinks
-                    if os.path.islink(file_path):
-                        continue
-
-                    try:
-                        stats = os.stat(file_path)
-                        file_size = stats.st_size / (1024 * 1024)  # MB
-                        file_mtime = stats.st_mtime
-                        file_age = now - file_mtime
-
-                        # Filter by age if specified
-                        if min_age_seconds is not None and file_age < min_age_seconds:
-                            continue
-
-                        yield file_path, file_size, file_mtime
-                    except (PermissionError, OSError):
-                        continue
-        except (PermissionError, OSError):
-            pass
-
-    def load_config(self):
-        if os.path.exists(self.config_path):
+    def _load_config(self):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open(self.config_path, 'r') as f:
+                with open(CONFIG_PATH, "r") as f:
                     self.stats = json.load(f)
             except (json.JSONDecodeError, IOError):
                 pass
-                
-    def save_config(self):
-        self.stats['last_run'] = time.time()
+
+    def _save_config(self):
+        self.stats["last_run"] = time.time()
         try:
-            with open(self.config_path, 'w') as f:
+            with open(CONFIG_PATH, "w") as f:
                 json.dump(self.stats, f)
         except IOError:
             pass
 
-    def get_system_info(self):
-        """Get system information for display"""
-        info = {}
-        
-        # Disk usage
-        disk = shutil.disk_usage('/')
-        info['disk_total'] = disk.total / (1024**3)  # GB
-        info['disk_used'] = disk.used / (1024**3)    # GB
-        info['disk_free'] = disk.free / (1024**3)    # GB
-        info['disk_percent'] = disk.used / disk.total * 100
-        
-        # Memory usage
-        mem = psutil.virtual_memory()
-        info['memory_total'] = mem.total / (1024**3)  # GB
-        info['memory_used'] = mem.used / (1024**3)    # GB
-        info['memory_free'] = mem.available / (1024**3)  # GB
-        info['memory_percent'] = mem.percent
-        
-        # CPU usage
-        info['cpu_percent'] = psutil.cpu_percent(interval=0.5)
-        
-        # Last cleanup stats
-        info['last_cleanup'] = self.stats.get('last_run', None)
-        info['space_cleaned'] = self.stats.get('total_size', 0)
-        info['files_cleaned'] = self.stats.get('total_files', 0)
-        
-        return info
+    # ── Logging ──────────────────────────────────────────────────────────
 
-    def _scan_temp_dir(self, temp_dir: str, age_limit_seconds: float) -> list:
-        """Scan a single temp directory for old files. Returns list of (path, size) tuples."""
-        skip_patterns = [".Trash", "Keychains", "Preferences", "Extensions"]
-        results = []
+    def _ensure_log_dir(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
 
-        for file_path, file_size, _ in self._iter_files(
-            temp_dir, skip_patterns=skip_patterns, min_age_seconds=age_limit_seconds
-        ):
-            results.append((file_path, file_size))
+    def _log(self, msg: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(LOG_PATH, "a") as f:
+                f.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
 
-        return results
+    # ── Safety ───────────────────────────────────────────────────────────
 
-    def clear_temp_files(self, days_old: int = 7, callback=None, max_workers: int = 4):
-        """Clear temporary files in user directories that are older than specified days.
+    def _is_safe(self, path: str) -> bool:
+        """Check path is within allowed roots and is not a root itself."""
+        try:
+            real = os.path.realpath(path)
+            # Never delete an allowed root directory itself
+            if real in self.allowed_roots:
+                return False
+            return any(real.startswith(root + os.sep) for root in self.allowed_roots)
+        except (PermissionError, OSError):
+            return False
 
-        Args:
-            days_old: Remove files older than this many days
-            callback: Progress callback function
-            max_workers: Number of parallel scanning threads
-        """
-        temp_dirs = [
-            os.path.join(self.user_home, "Library/Caches"),
-            os.path.join(self.user_home, "Library/Logs"),
-            os.path.join(self.user_home, "Downloads"),
-            os.path.join(self.user_home, "Library/Application Support/Google/Chrome/Default/Cache"),
-            os.path.join(self.user_home, "Library/Application Support/Firefox/Profiles"),
-            os.path.join(self.user_home, "Library/Safari/Cache"),
-            "/tmp",
-            "/private/var/folders"  # System-wide temporary files
-        ]
+    # ── Deletion ─────────────────────────────────────────────────────────
 
-        total_size = 0
-        total_files = 0
-        age_limit_seconds = days_old * 86400
+    def _safe_delete(self, path: str, size_mb: float = 0) -> bool:
+        """Unified safe deletion for files and directories."""
+        if os.path.islink(path):
+            return False
+        if not self._is_safe(path):
+            self._log(f"Blocked: {path}")
+            return False
 
-        self._log(f"Starting temp file cleanup. Days old: {days_old}")
+        label = f"{size_mb:.2f} MB" if size_mb > 0.01 else "<0.01 MB"
 
-        # Filter to existing directories
-        existing_dirs = [d for d in temp_dirs if os.path.exists(d)]
-
-        if callback:
-            callback(f"Scanning {len(existing_dirs)} directories in parallel...")
-
-        # Parallel scan phase
-        files_to_delete = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_dir = {
-                executor.submit(self._scan_temp_dir, d, age_limit_seconds): d
-                for d in existing_dirs
-            }
-
-            for future in as_completed(future_to_dir):
-                dir_name = future_to_dir[future]
-                try:
-                    results = future.result()
-                    files_to_delete.extend(results)
-                    if callback:
-                        callback(f"Found {len(results)} files in {dir_name}")
-                except Exception as e:
-                    self._log(f"Warning: Error scanning {dir_name}: {e}")
-
-        # Sequential delete phase (for accurate progress reporting)
-        for file_path, file_size in files_to_delete:
-            if self._delete_file(file_path, file_size, callback):
-                total_size += file_size
-                total_files += 1
-
-        # Note: Stats are saved by the caller (GUI or CLI) after all operations complete
-        # to avoid overwriting cumulative totals from multiple cleanup operations
-
-        return total_files, total_size
-
-    def clear_ds_store(self, callback=None):
-        """Find and remove .DS_Store files"""
-        total_files = 0
-        total_size = 0
-
-        # followlinks=False prevents symlink traversal attacks
-        for root, dirs, files in os.walk(self.user_home, followlinks=False):
-            for file in files:
-                if file == ".DS_Store":
-                    file_path = os.path.join(root, file)
-
-                    # Skip symlinks for safety
-                    if os.path.islink(file_path):
-                        continue
-
-                    try:
-                        # Get size before removing
-                        file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-                        if self._delete_file(file_path, file_size, callback=callback):
-                            total_files += 1
-                            total_size += file_size
-                    except (PermissionError, OSError):
-                        pass
-
-        self._log(f".DS_Store cleanup complete. Files: {total_files}, Size: {total_size:.2f} MB")
-
-        
-        return total_files, total_size
-
-    def remove_language_files(self, callback=None):
-        """Remove unused language files to save space"""
-        language_dirs = [
-            os.path.join(self.user_home, "Library/Application Support"),
-            "/Applications"
-        ]
-        
-        target_folders = [".lproj"]
-        # Keep only English language files
-        keep_languages = ["en.lproj", "en_US.lproj", "English.lproj", "Base.lproj"]
-        
-        total_files = 0
-        total_size = 0
-        
-        for lang_dir in language_dirs:
-            if not os.path.exists(lang_dir):
-                continue
-                
-            if callback:
-                callback(f"Scanning language files in: {lang_dir}")
-                
-            # followlinks=False prevents symlink traversal
-            for root, dirs, files in os.walk(lang_dir, followlinks=False):
-                for d in dirs:
-                    if d.endswith(".lproj") and d not in keep_languages:
-                        lang_path = os.path.join(root, d)
-
-                        try:
-                            # Check directory status FIRST, then calculate size
-                            # This prevents TOCTOU race conditions
-                            if not os.path.isdir(lang_path) or os.path.islink(lang_path):
-                                continue
-
-                            dir_size = self._get_dir_size(lang_path)
-                            if self._delete_dir(lang_path, dir_size, callback=callback):
-                                total_files += 1
-                                total_size += dir_size
-                        except (PermissionError, OSError) as e:
-                            self._log(f"Warning: Could not process {lang_path}: {e}")
-
-        self._log(f"Language file cleanup complete. Files: {total_files}, Size: {total_size:.2f} MB")
-        return total_files, total_size
-
-    def clear_app_caches(self, callback=None):
-        """Clear application-specific caches"""
-        app_caches = [
-            os.path.join(self.user_home, "Library/Caches"),
-            os.path.join(self.user_home, "Library/Application Support/Google/Chrome/Default/Cache"),
-            os.path.join(self.user_home, "Library/Application Support/Firefox/Profiles"),
-            os.path.join(self.user_home, "Library/Containers/com.apple.Safari/Data/Library/Caches"),
-            os.path.join(self.user_home, "Library/Containers/com.apple.mail/Data/Library/Caches"),
-            os.path.join(self.user_home, "Library/Containers/com.apple.Photos/Data/Library/Caches")
-        ]
-        
-        total_files = 0
-        total_size = 0
-        
-        for cache_dir in app_caches:
-            if not os.path.exists(cache_dir):
-                continue
-                
-            if callback:
-                callback(f"Clearing cache: {cache_dir}")
-                
-            for root, dirs, files in os.walk(cache_dir, topdown=True):
-                for file in files:
-                    try:
-                        file_path = os.path.join(root, file)
-                        file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-
-                        if self._delete_file(file_path, file_size, callback):
-                            total_files += 1
-                            total_size += file_size
-                    except (PermissionError, OSError):
-                        pass
-        
-        return total_files, total_size
-
-    def clear_trash(self, callback=None):
-        """Empty the Trash - single-pass implementation with dry-run support"""
-        trash_dir = os.path.join(self.user_home, ".Trash")
-        total_files = 0
-        total_size = 0
-
-        if not os.path.exists(trash_dir):
-            return total_files, total_size
-
-        if callback:
-            callback("Emptying Trash...")
+        if self.dry_run:
+            self._log(f"[DRY] {path} ({label})")
+            return True
 
         try:
-            for item in os.listdir(trash_dir):
-                item_path = os.path.join(trash_dir, item)
-                try:
-                    if os.path.islink(item_path):
-                        # Skip symlinks for safety
-                        continue
-
-                    if os.path.isdir(item_path):
-                        dir_size = self._get_dir_size(item_path)
-                        if self._delete_dir(item_path, dir_size, callback):
-                            total_size += dir_size
-                            total_files += 1
-                    else:
-                        file_size = os.path.getsize(item_path) / (1024 * 1024)
-                        if self._delete_file(item_path, file_size, callback):
-                            total_size += file_size
-                            total_files += 1
-                except (PermissionError, OSError) as e:
-                    self._log(f"Warning: Could not process {item_path}: {e}")
-
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+            self._log(f"Deleted: {path} ({label})")
+            return True
         except (PermissionError, OSError) as e:
-            self._log(f"Warning: Could not access trash directory: {e}")
-
-        return total_files, total_size
-
-    def flush_dns_cache(self, callback=None):
-        """Flush DNS cache (macOS only)"""
-        if platform.system() != "Darwin":
-            if callback:
-                callback("DNS cache flush is only available on macOS.")
+            self._log(f"Failed: {path}: {e}")
             return False
-            
-        commands = [
-            ["dscacheutil", "-flushcache"],
-            ["sudo", "killall", "-HUP", "mDNSResponder"],
-            ["sudo", "killall", "-HUP", "mDNSResponderHelper"]
-        ]
-        
-        success = True
-        for cmd in commands:
+
+    # ── Scanning ─────────────────────────────────────────────────────────
+
+    def _scan_files(self, directory: str, min_age_s: float = 0):
+        """Fast recursive scanner using os.scandir. Yields (path, size_mb)."""
+        if not os.path.isdir(directory):
+            return
+
+        now = time.time()
+        stack = [directory]
+
+        while stack:
+            current = stack.pop()
             try:
-                if cmd[0] == "sudo":
-                    if callback:
-                        callback(f"To flush DNS cache, run: {' '.join(cmd)}")
-                else:
-                    subprocess.run(cmd, check=True, capture_output=True)
-                    if callback:
-                        callback(f"Executed: {' '.join(cmd)}")
-            except subprocess.SubprocessError:
-                success = False
-                
-        return success
+                with os.scandir(current) as it:
+                    for entry in it:
+                        name = entry.name
 
-    def purge_memory(self, callback=None):
-        """Purge inactive memory (requires sudo)"""
-        if callback:
-            callback("To purge memory, run: sudo purge")
-        return True
+                        # Skip protected dirs
+                        if entry.is_dir(follow_symlinks=False):
+                            if name in SKIP_DIRS or name.startswith("."):
+                                continue
+                            stack.append(entry.path)
+                            continue
 
-    def restart_dock_and_finder(self, callback=None):
-        """Restart Dock and Finder to refresh UI"""
-        commands = [
-            ["killall", "Dock"],
-            ["killall", "Finder"]
-        ]
-        
-        success = True
-        for cmd in commands:
-            try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                if callback:
-                    callback(f"Executed: {' '.join(cmd)}")
-            except subprocess.SubprocessError:
-                success = False
-                
-        return success
+                        # Skip symlinks, hidden files, system files
+                        if entry.is_symlink():
+                            continue
+                        if name.startswith(".") or name in SKIP_FILES:
+                            continue
 
-    def find_large_files(self, min_size_mb: float = 100, limit: int = 50, callback=None):
-        """Find large files taking up space using heap for memory efficiency.
-
-        Args:
-            min_size_mb: Minimum file size in MB to consider
-            limit: Maximum number of files to return (keeps only top N largest)
-            callback: Progress callback function
-
-        Returns:
-            List of (file_path, size_mb) tuples, sorted largest first
-        """
-        # Use min-heap to efficiently keep track of top N largest files
-        top_files = []
-
-        if callback:
-            callback("Searching for large files...")
-
-        # Skip patterns - note: /Library/ would incorrectly skip ~/Library/
-        # We want to skip /System and system Library, but include user Library
-        system_skip = ["/System/", "/.Trash"]
-
-        for root, dirs, files in os.walk(self.user_home):
-            # Skip system directories and Trash
-            if any(skip in root for skip in system_skip):
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            if min_age_s > 0 and (now - st.st_mtime) < min_age_s:
+                                continue
+                            yield entry.path, st.st_size / MB
+                        except (PermissionError, OSError):
+                            continue
+            except (PermissionError, OSError):
                 continue
 
-            # Skip the root /Library but not ~/Library
-            if root.startswith("/Library/"):
+    # ── Cleanup Operations ───────────────────────────────────────────────
+
+    def clean_caches(self, days: int = 7, verbose: bool = False) -> tuple:
+        """Clean system and application caches (merged — no double-scanning)."""
+        age_s = days * 86400
+        total_files = 0
+        total_mb = 0.0
+
+        for d in CACHE_DIRS:
+            if not os.path.isdir(d):
+                continue
+            if verbose:
+                print(f"  {C.DIM}Scanning {d}{C.RESET}")
+
+            for path, size in self._scan_files(d, min_age_s=age_s):
+                if self._safe_delete(path, size):
+                    total_files += 1
+                    total_mb += size
+
+        return total_files, total_mb
+
+    def clean_dev_caches(self, verbose: bool = False) -> tuple:
+        """Clean developer tool caches (Xcode DerivedData, Homebrew, npm, pip, etc.)."""
+        total_files = 0
+        total_mb = 0.0
+
+        for d in DEV_CACHE_DIRS:
+            if not os.path.isdir(d):
+                continue
+            if verbose:
+                print(f"  {C.DIM}Cleaning {d}{C.RESET}")
+
+            for path, size in self._scan_files(d):
+                if self._safe_delete(path, size):
+                    total_files += 1
+                    total_mb += size
+
+        return total_files, total_mb
+
+    def clean_ds_store(self, verbose: bool = False) -> tuple:
+        """Remove .DS_Store files from home directory."""
+        total_files = 0
+        total_mb = 0.0
+
+        stack = [HOME]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in SKIP_DIRS:
+                                stack.append(entry.path)
+                            continue
+                        if entry.name == ".DS_Store" and not entry.is_symlink():
+                            try:
+                                size = entry.stat(follow_symlinks=False).st_size / MB
+                                if self._safe_delete(entry.path, size):
+                                    total_files += 1
+                                    total_mb += size
+                            except (PermissionError, OSError):
+                                continue
+            except (PermissionError, OSError):
                 continue
 
-            for file in files:
+        return total_files, total_mb
+
+    def clean_logs(self, verbose: bool = False) -> tuple:
+        """Clean old diagnostic reports and crash logs."""
+        total_files = 0
+        total_mb = 0.0
+
+        for d in LOG_CLEANUP_DIRS:
+            if not os.path.isdir(d):
+                continue
+            if verbose:
+                print(f"  {C.DIM}Cleaning {d}{C.RESET}")
+
+            for path, size in self._scan_files(d):
+                if self._safe_delete(path, size):
+                    total_files += 1
+                    total_mb += size
+
+        return total_files, total_mb
+
+    def clean_mail(self, verbose: bool = False) -> tuple:
+        """Clean Mail.app downloaded attachments (copies — originals stay in Mail)."""
+        total_files = 0
+        total_mb = 0.0
+
+        if not os.path.isdir(MAIL_DOWNLOADS):
+            return total_files, total_mb
+
+        if verbose:
+            print(f"  {C.DIM}Cleaning {MAIL_DOWNLOADS}{C.RESET}")
+
+        for path, size in self._scan_files(MAIL_DOWNLOADS):
+            if self._safe_delete(path, size):
+                total_files += 1
+                total_mb += size
+
+        return total_files, total_mb
+
+    def clean_language_files(self, verbose: bool = False) -> tuple:
+        """Remove non-English .lproj bundles from applications."""
+        keep = frozenset({"en.lproj", "en_US.lproj", "English.lproj", "Base.lproj"})
+        search_roots = [
+            os.path.join(HOME, "Library/Application Support"),
+            "/Applications",
+        ]
+        total_files = 0
+        total_mb = 0.0
+
+        for root_dir in search_roots:
+            if not os.path.isdir(root_dir):
+                continue
+            if verbose:
+                print(f"  {C.DIM}Scanning {root_dir}{C.RESET}")
+
+            stack = [root_dir]
+            while stack:
+                current = stack.pop()
                 try:
-                    file_path = os.path.join(root, file)
-
-                    # Skip symbolic links
-                    if os.path.islink(file_path):
-                        continue
-
-                    # Get file size
-                    file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
-
-                    # If file is larger than minimum size
-                    if file_size >= min_size_mb:
-                        if len(top_files) < limit:
-                            # Heap not full, just add
-                            heapq.heappush(top_files, (file_size, file_path))
-                            if callback:
-                                callback(f"Found large file: {file_path} ({file_size:.2f} MB)")
-                        elif file_size > top_files[0][0]:
-                            # File is larger than smallest in heap, replace
-                            heapq.heapreplace(top_files, (file_size, file_path))
-                            if callback:
-                                callback(f"Found large file: {file_path} ({file_size:.2f} MB)")
-
+                    with os.scandir(current) as it:
+                        for entry in it:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                            if entry.name.endswith(".lproj") and entry.name not in keep:
+                                # Calculate size then delete the whole bundle
+                                size = 0.0
+                                for fp, fs in self._scan_files(entry.path):
+                                    size += fs
+                                if self._safe_delete(entry.path, size):
+                                    total_files += 1
+                                    total_mb += size
+                            else:
+                                stack.append(entry.path)
                 except (PermissionError, OSError):
                     continue
 
-        # Convert heap to sorted list (largest first)
-        result = [(path, size) for size, path in sorted(top_files, reverse=True)]
+        return total_files, total_mb
 
-        return result
+    def empty_trash(self, verbose: bool = False) -> tuple:
+        """Empty the user's Trash."""
+        trash = os.path.join(HOME, ".Trash")
+        total_files = 0
+        total_mb = 0.0
 
-class CleanupGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("MacCleaner")
-        self.root.geometry("700x600")
-        self.root.resizable(True, True)
-        
-        # Set icon if available
+        if not os.path.isdir(trash):
+            return total_files, total_mb
+
+        if verbose:
+            print(f"  {C.DIM}Emptying {trash}{C.RESET}")
+
         try:
-            self.root.iconbitmap("icon.ico")  # Replace with your icon
-        except:
+            with os.scandir(trash) as it:
+                for entry in it:
+                    if entry.is_symlink():
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            size = sum(s for _, s in self._scan_files(entry.path))
+                        else:
+                            size = entry.stat(follow_symlinks=False).st_size / MB
+                        if self._safe_delete(entry.path, size):
+                            total_files += 1
+                            total_mb += size
+                    except (PermissionError, OSError):
+                        continue
+        except (PermissionError, OSError):
             pass
-            
-        # Style
-        self.style = ttk.Style()
-        self.style.configure("TButton", padding=6, relief="flat", background="#3498db")
-        self.style.configure("TFrame", background="#f5f5f5")
-        self.style.configure("TLabel", background="#f5f5f5")
-        self.style.configure("Header.TLabel", font=("Helvetica", 16, "bold"))
-        self.style.configure("Subhead.TLabel", font=("Helvetica", 12, "bold"))
-        self.style.configure("Info.TLabel", font=("Helvetica", 10))
-        
-        # Main frame
-        self.main_frame = ttk.Frame(self.root, padding="10")
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Header
-        header_frame = ttk.Frame(self.main_frame)
-        header_frame.pack(fill=tk.X, pady=10)
-        
-        ttk.Label(header_frame, text="MacCleaner", style="Header.TLabel").pack(side=tk.LEFT)
-        
-        # System info frame
-        self.info_frame = ttk.LabelFrame(self.main_frame, text="System Information", padding=10)
-        self.info_frame.pack(fill=tk.X, pady=5)
-        
-        # System info labels
-        self.disk_label = ttk.Label(self.info_frame, text="Disk Space: ", style="Info.TLabel")
-        self.disk_label.grid(row=0, column=0, sticky="w", pady=2)
-        
-        self.memory_label = ttk.Label(self.info_frame, text="Memory: ", style="Info.TLabel")
-        self.memory_label.grid(row=1, column=0, sticky="w", pady=2)
-        
-        self.cpu_label = ttk.Label(self.info_frame, text="CPU Usage: ", style="Info.TLabel")
-        self.cpu_label.grid(row=2, column=0, sticky="w", pady=2)
-        
-        self.cleanup_label = ttk.Label(self.info_frame, text="Last Cleanup: ", style="Info.TLabel")
-        self.cleanup_label.grid(row=3, column=0, sticky="w", pady=2)
-        
-        # Features frame
-        features_frame = ttk.LabelFrame(self.main_frame, text="Cleanup Options", padding=10)
-        features_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Checkboxes for options
-        self.features = {
-            "temp_files": {"text": "Temporary Files", "var": tk.BooleanVar(value=True)},
-            "app_caches": {"text": "Application Caches", "var": tk.BooleanVar(value=True)},
-            "ds_store": {"text": ".DS_Store Files", "var": tk.BooleanVar(value=True)},
-            "language_files": {"text": "Unused Language Files", "var": tk.BooleanVar(value=False)},
-            "trash": {"text": "Empty Trash", "var": tk.BooleanVar(value=True)},
-            "dns_cache": {"text": "Flush DNS Cache", "var": tk.BooleanVar(value=False)},
-            "memory": {"text": "Purge Memory", "var": tk.BooleanVar(value=False)},
-            "restart_ui": {"text": "Restart Dock & Finder", "var": tk.BooleanVar(value=False)},
-        }
-        
-        # Create checkboxes
-        row = 0
-        col = 0
-        for key, feature in self.features.items():
-            ttk.Checkbutton(features_frame, text=feature["text"], variable=feature["var"]).grid(
-                row=row, column=col, sticky="w", padx=5, pady=5
-            )
-            col += 1
-            if col > 1:
-                col = 0
-                row += 1
-                
-        # Age selector for temp files
-        age_frame = ttk.Frame(features_frame)
-        age_frame.grid(row=row+1, column=0, columnspan=2, sticky="w", padx=5, pady=10)
-        
-        ttk.Label(age_frame, text="Remove files older than: ").pack(side=tk.LEFT)
-        
-        self.age_var = tk.StringVar(value="7")
-        age_combo = ttk.Combobox(age_frame, textvariable=self.age_var, width=5)
-        age_combo['values'] = ('1', '3', '7', '14', '30')
-        age_combo.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(age_frame, text="days").pack(side=tk.LEFT)
-        
-        # Analyze button
-        analyze_btn = ttk.Button(features_frame, text="Analyze System", command=self.analyze_system)
-        analyze_btn.grid(row=row+2, column=0, sticky="w", padx=5, pady=10)
-        
-        # Clean button
-        clean_btn = ttk.Button(features_frame, text="Clean Now", command=self.start_cleanup)
-        clean_btn.grid(row=row+2, column=1, sticky="w", padx=5, pady=10)
-        
-        # Progress frame
-        progress_frame = ttk.LabelFrame(self.main_frame, text="Progress", padding=10)
-        progress_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", 
-                                            variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, pady=5)
-        
-        # Status text
-        self.status_text = tk.Text(progress_frame, height=10, wrap=tk.WORD)
-        self.status_text.pack(fill=tk.BOTH, expand=True, pady=5)
-        scrollbar = ttk.Scrollbar(self.status_text, orient="vertical", command=self.status_text.yview)
-        self.status_text.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Initialize cleanup object
-        self.cleaner = SystemCleanup()
-        
-        # Update system info
-        self.update_system_info()
-        
-    def update_system_info(self):
-        """Update the system information display"""
-        info = self.cleaner.get_system_info()
-        
-        # Update disk info
-        self.disk_label.config(text=f"Disk Space: {info['disk_used']:.1f}GB used of {info['disk_total']:.1f}GB ({info['disk_percent']:.1f}%)")
-        
-        # Update memory info
-        self.memory_label.config(text=f"Memory: {info['memory_used']:.1f}GB used of {info['memory_total']:.1f}GB ({info['memory_percent']:.1f}%)")
-        
-        # Update CPU info
-        self.cpu_label.config(text=f"CPU Usage: {info['cpu_percent']:.1f}%")
-        
-        # Update last cleanup info
-        if info['last_cleanup']:
-            last_time = time.strftime('%Y-%m-%d %H:%M', time.localtime(info['last_cleanup']))
-            self.cleanup_label.config(text=f"Last Cleanup: {last_time} • {info['files_cleaned']} files • {info['space_cleaned']:.2f} MB freed")
-        else:
-            self.cleanup_label.config(text="Last Cleanup: Never")
-        
-        # Schedule next update
-        self.root.after(5000, self.update_system_info)
-        
-    def log_message(self, message):
-        """Add message to the status text widget (thread-safe)"""
-        def _update():
-            self.status_text.insert(tk.END, message + "\n")
-            self.status_text.see(tk.END)
-        # Schedule on main thread for thread safety
-        self.root.after(0, _update)
 
-    def set_progress(self, value):
-        """Set progress bar value (thread-safe)"""
-        self.root.after(0, lambda: self.progress_var.set(value))
-        
-    def analyze_system(self):
-        """Analyze the system and report potential cleanup options"""
-        self.log_message("Starting system analysis...")
-        self.progress_var.set(0)
-        
-        def run_analysis():
-            # Check temp files
-            self.log_message("Analyzing temporary files...")
-            self.set_progress(20)
+        return total_files, total_mb
 
-            # Find large files
-            self.log_message("Scanning for large files...")
-            large_files = self.cleaner.find_large_files(min_size_mb=100, callback=self.log_message)
+    def flush_dns(self, verbose: bool = False) -> bool:
+        """Actually flush the DNS cache (prompts for admin password via GUI dialog)."""
+        if verbose:
+            print(f"  {C.DIM}Flushing DNS cache...{C.RESET}")
 
-            self.set_progress(80)
-
-            # Report large files
-            if large_files:
-                self.log_message("\nLarge files found:")
-                for i, (file_path, size) in enumerate(large_files[:10]):  # Show top 10
-                    self.log_message(f"{i+1}. {file_path} ({size:.2f} MB)")
-
-            self.set_progress(100)
-            self.log_message("Analysis complete!")
-            
-        threading.Thread(target=run_analysis, daemon=True).start()
-        
-    def start_cleanup(self):
-        """Start the cleanup process based on selected options"""
-        self.log_message("Starting cleanup...")
-        self.progress_var.set(0)
-        
         try:
-            days_old = int(self.age_var.get())
-        except ValueError:
-            days_old = 7
-            
-        # Get selected options
-        options = {k: v["var"].get() for k, v in self.features.items()}
-        
-        def run_cleanup():
-            total_steps = sum(1 for v in options.values() if v)
+            subprocess.run(
+                ["dscacheutil", "-flushcache"],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.SubprocessError:
+            pass
 
-            if total_steps == 0:
-                self.log_message("No cleanup options selected.")
-                return
+        # Use osascript for the sudo commands — shows a native password dialog
+        script = 'do shell script "killall -HUP mDNSResponder 2>/dev/null; true" with administrator privileges'
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=True,
+                capture_output=True,
+            )
+            self._log("DNS cache flushed")
+            return True
+        except subprocess.SubprocessError:
+            self._log("DNS flush: user cancelled or failed")
+            return False
 
-            current_step = 0
-            total_files = 0
-            total_size = 0
+    def free_ram(self, verbose: bool = False) -> bool:
+        """Actually purge inactive memory (prompts for admin password via GUI dialog)."""
+        if verbose:
+            print(f"  {C.DIM}Purging inactive memory...{C.RESET}")
 
-            # Clear temp files
-            if options["temp_files"]:
-                self.log_message("\nClearing temporary files...")
-                files, size = self.cleaner.clear_temp_files(days_old=days_old, callback=self.log_message)
-                total_files += files
-                total_size += size
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+        script = 'do shell script "purge" with administrator privileges'
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=True,
+                capture_output=True,
+            )
+            self._log("Memory purged")
+            return True
+        except subprocess.SubprocessError:
+            self._log("Memory purge: user cancelled or failed")
+            return False
 
-            # Clear app caches
-            if options["app_caches"]:
-                self.log_message("\nClearing application caches...")
-                files, size = self.cleaner.clear_app_caches(callback=self.log_message)
-                total_files += files
-                total_size += size
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+    def reset_quicklook(self, verbose: bool = False) -> bool:
+        """Reset the QuickLook thumbnail cache."""
+        if verbose:
+            print(f"  {C.DIM}Resetting QuickLook cache...{C.RESET}")
 
-            # Clear .DS_Store files
-            if options["ds_store"]:
-                self.log_message("\nRemoving .DS_Store files...")
-                files, size = self.cleaner.clear_ds_store(callback=self.log_message)
-                total_files += files
-                total_size += size
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+        try:
+            subprocess.run(
+                ["qlmanage", "-r", "cache"],
+                check=True,
+                capture_output=True,
+            )
+            self._log("QuickLook cache reset")
+            return True
+        except subprocess.SubprocessError:
+            self._log("QuickLook reset failed")
+            return False
 
-            # Remove language files
-            if options["language_files"]:
-                self.log_message("\nRemoving unused language files...")
-                files, size = self.cleaner.remove_language_files(callback=self.log_message)
-                total_files += files
-                total_size += size
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+    def find_large_files(
+        self, min_size_mb: float = 100, limit: int = 50
+    ) -> list:
+        """Find the largest files in the home directory using a min-heap."""
+        heap = []
 
-            # Empty trash
-            if options["trash"]:
-                self.log_message("\nEmptying trash...")
-                files, size = self.cleaner.clear_trash(callback=self.log_message)
-                total_files += files
-                total_size += size
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+        stack = [HOME]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in SKIP_DIRS and not entry.name.startswith("."):
+                                stack.append(entry.path)
+                            continue
+                        if entry.is_symlink():
+                            continue
+                        try:
+                            size = entry.stat(follow_symlinks=False).st_size / MB
+                            if size >= min_size_mb:
+                                if len(heap) < limit:
+                                    heapq.heappush(heap, (size, entry.path))
+                                elif size > heap[0][0]:
+                                    heapq.heapreplace(heap, (size, entry.path))
+                        except (PermissionError, OSError):
+                            continue
+            except (PermissionError, OSError):
+                continue
 
-            # Flush DNS cache
-            if options["dns_cache"]:
-                self.log_message("\nFlushing DNS cache...")
-                self.cleaner.flush_dns_cache(callback=self.log_message)
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+        return [(p, s) for s, p in sorted(heap, reverse=True)]
 
-            # Purge memory
-            if options["memory"]:
-                self.log_message("\nPurging inactive memory...")
-                self.cleaner.purge_memory(callback=self.log_message)
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
+    def system_info(self) -> dict:
+        """Get current system resource usage."""
+        disk = shutil.disk_usage("/")
+        mem = psutil.virtual_memory()
+        return {
+            "disk_total_gb": disk.total / GB,
+            "disk_used_gb": disk.used / GB,
+            "disk_free_gb": disk.free / GB,
+            "disk_pct": disk.used / disk.total * 100,
+            "mem_total_gb": mem.total / GB,
+            "mem_used_gb": mem.used / GB,
+            "mem_free_gb": mem.available / GB,
+            "mem_pct": mem.percent,
+            "cpu_pct": psutil.cpu_percent(interval=0.3),
+            "last_run": self.stats.get("last_run"),
+            "total_cleaned_mb": self.stats.get("total_size", 0),
+            "total_cleaned_files": self.stats.get("total_files", 0),
+        }
 
-            # Restart Dock and Finder
-            if options["restart_ui"]:
-                self.log_message("\nRestarting Dock and Finder...")
-                self.cleaner.restart_dock_and_finder(callback=self.log_message)
-                current_step += 1
-                self.set_progress((current_step / total_steps) * 100)
 
-            # Final progress update
-            self.set_progress(100)
-            
-            # Save cleanup stats
-            self.cleaner.stats['total_files'] = total_files
-            self.cleaner.stats['total_size'] = total_size
-            self.cleaner.save_config()
-            
-            # Update system info
-            self.update_system_info()
-            
-            # Show completion message
-            self.log_message(f"\nCleanup completed!")
-            self.log_message(f"Removed {total_files} files, freeing {total_size:.2f} MB of space.")
-            
-            # Show messagebox on completion (thread-safe)
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Cleanup Complete",
-                f"Successfully cleaned {total_files} files, freeing {total_size:.2f} MB of space."
-            ))
-            
-        threading.Thread(target=run_cleanup, daemon=True).start()
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def _bar(pct: float, w: int = 20) -> str:
+    f = int(pct / 100 * w)
+    color = C.GREEN if pct < 60 else C.YELLOW if pct < 85 else C.RED
+    return f"{color}{'█' * f}{C.DIM}{'░' * (w - f)}{C.RESET}"
+
+
+def _sz(mb: float) -> str:
+    if mb < 0.01:
+        return "—"
+    return f"{mb:.1f} MB" if mb < 1024 else f"{mb / 1024:.2f} GB"
+
 
 def main():
-    # Check if running in GUI or CLI mode
-    if len(sys.argv) > 1:
-        # CLI mode
-        parser = argparse.ArgumentParser(description="Enhanced system cleanup utility for macOS")
-        parser.add_argument("--days", type=int, default=7, help="Remove files older than this many days (default: 7)")
-        parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without actually deleting")
-        parser.add_argument("--no-temp", action="store_true", help="Skip temporary files cleanup")
-        parser.add_argument("--no-ds-store", action="store_true", help="Skip .DS_Store cleanup")
-        parser.add_argument("--no-dns", action="store_true", help="Skip DNS cache flush")
-        parser.add_argument("--no-memory", action="store_true", help="Skip memory purge")
-        parser.add_argument("--no-system-cache", action="store_true", help="Skip system cache cleanup")
-        parser.add_argument("--no-restart-ui", action="store_true", help="Skip restarting Dock and Finder")
-        
-        args = parser.parse_args()
-        
-        # Get user's home directory
-        user_home = str(Path.home())
-        
-        print(f"Enhanced System Cleanup Utility for macOS")
-        print(f"{'DRY RUN MODE' if args.dry_run else 'LIVE MODE'} - Files older than {args.days} days will be removed")
+    parser = argparse.ArgumentParser(description="Lean macOS system cleaner")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without deleting")
+    parser.add_argument("--days", type=int, default=7, help="Cache age threshold in days (default: 7)")
+    parser.add_argument("--aggressive", action="store_true", help="Include language files cleanup")
+    parser.add_argument("--skip", nargs="+", default=[], metavar="OP",
+                        help="Skip: caches dev ds_store logs mail trash quicklook dns ram language")
+    parser.add_argument("--analyze", action="store_true", help="Find large files only")
+    parser.add_argument("--info", action="store_true", help="Show system info only")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Detailed progress")
+    args = parser.parse_args()
 
-        cleaner = SystemCleanup(dry_run=args.dry_run)
-        
-        # Run selected cleanup operations
-        if not args.no_temp:
-            files, size = cleaner.clear_temp_files(days_old=args.days, callback=print)
-            print(f"\nRemoved {files} temporary files ({size:.2f} MB)")
-            
-        if not args.no_ds_store:
-            files, size = cleaner.clear_ds_store(callback=print)
-            print(f"\nRemoved {files} .DS_Store files ({size:.2f} MB)")
-            
-        if not args.no_dns:
-            cleaner.flush_dns_cache(callback=print)
-        
-        if not args.no_memory:
-            cleaner.purge_memory(callback=print)
-        
-        if not args.no_system_cache:
-            files, size = cleaner.clear_app_caches(callback=print)
-            print(f"\nCleared {files} cache files ({size:.2f} MB)")
-        
-        if not args.no_restart_ui:
-            cleaner.restart_dock_and_finder(callback=print)
-            
-        print("\nCleanup completed successfully!")
-        print("Note: Some operations require admin privileges and will need to be")
-        print("executed manually in Terminal with sudo access.")
-    else:
-        # GUI mode
-        root = tk.Tk()
-        app = CleanupGUI(root)
-        root.mainloop()
+    skip = set(args.skip)
+    cleaner = SystemCleanup(dry_run=args.dry_run)
+
+    # ── Header & system info ─────────────────────────────────────────────
+    mode = f"{C.YELLOW}DRY RUN{C.RESET}" if args.dry_run else f"{C.GREEN}LIVE{C.RESET}"
+    print(f"\n  {C.BOLD}Mac Clean{C.RESET}  {C.DIM}·{C.RESET}  {mode}\n")
+
+    info = cleaner.system_info()
+    print(f"  {C.BOLD}DISK{C.RESET}    {_bar(info['disk_pct'])}  "
+          f"{info['disk_used_gb']:.1f}/{info['disk_total_gb']:.1f} GB  "
+          f"{C.GREEN}{info['disk_free_gb']:.1f} GB free{C.RESET}")
+    print(f"  {C.BOLD}MEMORY{C.RESET}  {_bar(info['mem_pct'])}  "
+          f"{info['mem_used_gb']:.1f}/{info['mem_total_gb']:.1f} GB  "
+          f"{C.GREEN}{info['mem_free_gb']:.1f} GB free{C.RESET}")
+    print(f"  {C.BOLD}CPU{C.RESET}     {_bar(info['cpu_pct'], 10)}  {info['cpu_pct']:.0f}%")
+    if info["last_run"]:
+        t = time.strftime("%b %d %H:%M", time.localtime(info["last_run"]))
+        print(f"  {C.DIM}Last: {t} · {info['total_cleaned_files']} files · {_sz(info['total_cleaned_mb'])}{C.RESET}")
+    print()
+
+    if args.info:
+        return
+
+    # ── Analyze mode ─────────────────────────────────────────────────────
+    if args.analyze:
+        print(f"  {C.BOLD}Large files (≥ 100 MB){C.RESET}\n")
+        large = cleaner.find_large_files(min_size_mb=100, limit=20)
+        if not large:
+            print(f"  {C.DIM}None found.{C.RESET}\n")
+            return
+        for i, (path, size) in enumerate(large, 1):
+            s = f"{size:.0f} MB" if size < 1024 else f"{size / 1024:.1f} GB"
+            sc = C.RED if size > 1024 else C.YELLOW if size > 500 else ""
+            print(f"  {i:>3}  {sc}{s:>10}{C.RESET}  {C.DIM}{path}{C.RESET}")
+        print()
+        return
+
+    # ── Operations table ─────────────────────────────────────────────────
+    # (key, label, method_name, method_kwargs, aggressive_only)
+    ops = [
+        ("caches",    "System & app caches",       "clean_caches",        {"days": args.days}, False),
+        ("dev",       "Developer caches",          "clean_dev_caches",    {},                  False),
+        ("ds_store",  ".DS_Store files",           "clean_ds_store",      {},                  False),
+        ("logs",      "Crash reports",             "clean_logs",          {},                  False),
+        ("mail",      "Mail downloads",            "clean_mail",          {},                  False),
+        ("trash",     "Trash",                     "empty_trash",         {},                  False),
+        ("quicklook", "QuickLook cache",           "reset_quicklook",     {},                  False),
+        ("dns",       "DNS cache",                 "flush_dns",           {},                  False),
+        ("ram",       "Inactive memory",           "free_ram",            {},                  False),
+        ("language",  "Language files",            "clean_language_files", {},                  True),
+    ]
+
+    results = []
+    for key, label, method, kwargs, aggressive_only in ops:
+        if key in skip:
+            continue
+        if aggressive_only and not args.aggressive:
+            continue
+
+        print(f"  {C.DOT} {label}")
+        ret = getattr(cleaner, method)(verbose=args.verbose, **kwargs)
+
+        # Methods return (files, mb) or bool
+        if isinstance(ret, tuple):
+            results.append((label, ret[0], ret[1]))
+        else:
+            results.append((label, 1 if ret else 0, 0.0))
+
+    # ── Results ──────────────────────────────────────────────────────────
+    W = 58
+    print(f"\n  {C.DIM}{'─' * W}{C.RESET}")
+    print(f"  {C.BOLD}{'':>2}{'Operation':<30} {'Files':>7}  {'Freed':>12}{C.RESET}")
+    print(f"  {C.DIM}{'─' * W}{C.RESET}")
+
+    total_f, total_mb = 0, 0.0
+    for name, files, mb in results:
+        icon = C.OK if files > 0 else C.SKIP
+        color = "" if files > 0 else C.DIM
+        print(f"  {icon} {color}{name:<30} {files:>7}  {_sz(mb):>12}{C.RESET}")
+        total_f += files
+        total_mb += mb
+
+    print(f"  {C.DIM}{'─' * W}{C.RESET}")
+    print(f"  {C.BOLD}{C.GREEN}  {'TOTAL':<30} {total_f:>7}  {_sz(total_mb):>12}{C.RESET}")
+    print(f"  {C.DIM}{'─' * W}{C.RESET}")
+
+    cleaner.stats.update({"total_files": total_f, "total_size": total_mb})
+    cleaner._save_config()
+
+    if args.dry_run:
+        print(f"\n  {C.YELLOW}Dry run — nothing was deleted.{C.RESET}")
+    print()
+
 
 if __name__ == "__main__":
     main()
