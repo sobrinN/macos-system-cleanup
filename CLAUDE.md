@@ -16,11 +16,11 @@ Single-file Python script (`system_clean_up.py`) — no GUI, no frameworks, just
 | `_scan_files()` | Fast recursive scanner using `os.scandir` (2-10x faster than `os.walk`) |
 | `_is_safe()` | Path containment check with cached realpath roots |
 | `clean_caches()` | System + app caches (unified — no double-scanning) |
-| `clean_dev_caches()` | Xcode DerivedData, Homebrew, npm, pip, Yarn, CocoaPods, Gradle |
+| `clean_dev_caches()` | Xcode DerivedData, npm, Composer and Gradle caches |
 | `clean_ds_store()` | Remove `.DS_Store` files from home directory |
 | `clean_logs()` | Old crash reports and diagnostic logs |
-| `clean_mail()` | Mail.app downloaded attachment copies |
-| `clean_language_files()` | Non-English `.lproj` bundles (aggressive only) |
+| `clean_mail()` | Old Mail.app downloaded attachment copies |
+| `clean_language_files()` | Non-English resources in unsigned user apps (aggressive only) |
 | `empty_trash()` | Empty `~/.Trash` |
 | `flush_dns()` | Actually flushes DNS via `osascript` admin prompt |
 | `free_ram()` | Actually purges memory via `osascript` admin prompt |
@@ -52,6 +52,12 @@ python3 system_clean_up.py --dry-run
 # Custom age threshold
 python3 system_clean_up.py --days 14
 
+# Include Photos/temp caches plus maintenance operations (Trash, DNS and QuickLook)
+python3 system_clean_up.py --full
+
+# Explicitly purge inactive memory with an admin prompt
+python3 system_clean_up.py --purge-memory
+
 # Include language file cleanup
 python3 system_clean_up.py --aggressive
 
@@ -76,8 +82,8 @@ python3 system_clean_up.py -v
 - Never deletes allowed roots themselves (`$HOME`, `/tmp`, `/private/var/folders`)
 - Skips protected dirs: `.Trash`, `Keychains`, `Preferences`, `Extensions`
 - Skips system files: hidden files, critical plist files
-- Age-based filtering on cache cleanup (default: 7 days)
-- `--dry-run` mode respected by all operations
+- Age-based filtering on cache, log and Mail cleanup
+- `--dry-run` performs no deletion, admin prompt, system command or state write
 - Logging to `~/Library/Logs/SystemCleanup/cleanup.log`
 
 ## Code Conventions
